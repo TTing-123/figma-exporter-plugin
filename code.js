@@ -14,7 +14,6 @@ figma.ui.onmessage = async (msg) => {
 };
 // 主导出函数
 async function handleExport() {
-    absPosMap.clear();
     const selection = figma.currentPage.selection;
     if (selection.length === 0) {
         figma.ui.postMessage({
@@ -32,8 +31,9 @@ async function handleExport() {
     const nodes = [];
     const imageRefs = new Map();
     const vectorRefs = new Map();
+    const fontRefs = new Map();
     for (const node of selection) {
-        const parsed = await parseNode(node, imageRefs, vectorRefs);
+        const parsed = await parseNode(node, imageRefs, vectorRefs, fontRefs);
         if (parsed) {
             nodes.push(parsed);
         }
@@ -55,6 +55,11 @@ async function handleExport() {
         const base64 = uint8ArrayToBase64(bytes);
         vectors[nodeId] = base64;
     }
+    // 构建字体列表
+    const fonts = {};
+    for (const [key, fontInfo] of fontRefs) {
+        fonts[key] = fontInfo;
+    }
     figma.ui.postMessage({
         type: 'progress',
         message: '正在打包...',
@@ -67,7 +72,8 @@ async function handleExport() {
         figmaFile: figma.fileKey || 'unknown',
         nodes: nodes,
         images: images,
-        vectors: vectors
+        vectors: vectors,
+        fonts: fonts
     };
     // 发送到 UI 进行下载
     figma.ui.postMessage({
@@ -82,9 +88,7 @@ async function handleExport() {
     });
 }
 // 解析节点
-// absPosMap: 存储每个节点修正后的绝对位置
-const absPosMap = new Map();
-async function parseNode(node, imageRefs, vectorRefs) {
+async function parseNode(node, imageRefs, vectorRefs, fontRefs) {
     var _a, _b;
     const base = {
         id: node.id,
@@ -97,44 +101,32 @@ async function parseNode(node, imageRefs, vectorRefs) {
         width: 'width' in node ? node.width : 0,
         height: 'height' in node ? node.height : 0,
     };
-    // 保存原始 Figma API 的 x/y
-    const origX = base.x;
-    const origY = base.y;
-    // 获取绝对位置：优先用 absoluteBoundingBox（画布坐标），它对 GROUP 节点也正确
-    // absoluteTransform 对 GROUP 有 bug（返回错误的 y 值）
-    if ('absoluteBoundingBox' in node && node.absoluteBoundingBox) {
-        const bbox = node.absoluteBoundingBox;
-        base.absoluteX = bbox.x;
-        base.absoluteY = bbox.y;
-        // 用 absoluteBoundingBox 的尺寸覆盖（更准确）
-        base.width = bbox.width;
-        base.height = bbox.height;
-    } else if ('absoluteTransform' in node) {
+    // 获取��对位置
+    if ('absoluteTransform' in node) {
         const transform = node.absoluteTransform;
         base.absoluteX = transform[0][2];
         base.absoluteY = transform[1][2];
     }
-    // 安全检查：如果无法获取绝对位置，用原始 x/y 作为后备
-    if (base.absoluteX === undefined || base.absoluteY === undefined) {
-        base.absoluteX = base.x;
-        base.absoluteY = base.y;
-    }
-    // 缓存绝对位置
-    absPosMap.set(node.id, { x: base.absoluteX, y: base.absoluteY });
-    // 计算相对父节点的偏移
-    {
-        const parent = node.parent;
-        if (parent && parent.type !== 'PAGE') {
-            const parentAbs = absPosMap.get(parent.id);
-            if (parentAbs) {
-                base.x = base.absoluteX - parentAbs.x;
-                base.y = base.absoluteY - parentAbs.y;
-            } else if ('absoluteBoundingBox' in parent && parent.absoluteBoundingBox) {
-                base.x = base.absoluteX - parent.absoluteBoundingBox.x;
-                base.y = base.absoluteY - parent.absoluteBoundingBox.y;
-            } else if ('absoluteTransform' in parent) {
-                base.x = base.absoluteX - parent.absoluteTransform[0][2];
-                base.y = base.absoluteY - parent.absoluteTransform[1][2];
+    // GROUP 特殊处理：Figma Plugin API 返回的 GROUP.x/y/width/height 可能不是
+    // UI 显示的真实 bbox（被旋转/变形过的 GROUP 其 transform.translation 不对应
+    // bbox.top-left）。用 absoluteRenderBounds 覆盖，让 JSON 中的数据与 Figma UI
+    // 显示的 X/Y/W/H 一致。
+    if (node.type === 'GROUP' && node.children && node.children.length > 0) {
+        const bounds = node.absoluteRenderBounds;
+        if (bounds && bounds.width > 0 && bounds.height > 0) {
+            base.absoluteX = bounds.x;
+            base.absoluteY = bounds.y;
+            base.width = bounds.width;
+            base.height = bounds.height;
+            const parent = node.parent;
+            if (parent && parent.type !== 'PAGE' && 'absoluteTransform' in parent) {
+                const pt = parent.absoluteTransform;
+                base.x = bounds.x - pt[0][2];
+                base.y = bounds.y - pt[1][2];
+            }
+            else {
+                base.x = bounds.x;
+                base.y = bounds.y;
             }
         }
     }
@@ -251,15 +243,25 @@ async function parseNode(node, imageRefs, vectorRefs) {
     // 处理文本
     if (node.type === 'TEXT') {
         base.characters = node.characters;
+        // 获取字体信息
+        const fontFamily = node.fontName !== figma.mixed ? node.fontName.family : '';
+        const fontWeight = node.fontName !== figma.mixed ? node.fontName.style : '';
         base.style = {
-            fontFamily: node.fontName !== figma.mixed ? node.fontName.family : '',
-            fontWeight: node.fontName !== figma.mixed ? node.fontName.style : '',
+            fontFamily: fontFamily,
+            fontWeight: fontWeight,
             fontSize: node.fontSize !== figma.mixed ? node.fontSize : 16,
             lineHeight: node.lineHeight !== figma.mixed ? node.lineHeight : null,
             letterSpacing: node.letterSpacing !== figma.mixed ? node.letterSpacing : null,
             textAlignHorizontal: node.textAlignHorizontal,
             textAlignVertical: node.textAlignVertical,
         };
+        // 收集字体信息
+        if (fontFamily && fontWeight) {
+            const fontKey = `${fontFamily}_${fontWeight}`;
+            if (!fontRefs.has(fontKey)) {
+                fontRefs.set(fontKey, { family: fontFamily, style: fontWeight });
+            }
+        }
         // 导出矢量文本为高分辨率 PNG
         try {
             const bytes = await node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 3 } });
@@ -273,30 +275,14 @@ async function parseNode(node, imageRefs, vectorRefs) {
     const vectorTypes = ['VECTOR', 'BOOLEAN', 'STAR', 'LINE', 'ELLIPSE', 'REGULAR_POLYGON'];
     if (vectorTypes.includes(node.type)) {
         try {
-            // 对有描边的线条节点使用 render bounds（包含描边区域），
-            // 其他节点使用 layout bounds（与 Figma UI 显示尺寸一致）。
-            const hasStroke = node.type === 'VECTOR' && 'strokeWeight' in node && node.strokeWeight > 0;
+            // useAbsoluteBounds: false 让 PNG 按 layout bounds (几何 bbox = width/height) 导出，
+            // 而非默认的 renderBounds。这样 PNG 尺寸与 figma UI 显示的节点尺寸一致。
             const bytes = await node.exportAsync({
                 format: 'PNG',
                 constraint: { type: 'SCALE', value: 3 },
-                useAbsoluteBounds: !hasStroke
+                useAbsoluteBounds: false
             });
             vectorRefs.set(node.id, bytes);
-            // 对有描边的线条节点：用 render bounds 的实际尺寸覆盖
-            // （useAbsoluteBounds=false 时 absoluteBoundingBox 包含描边区域）
-            if (hasStroke && 'absoluteRenderBounds' in node && node.absoluteRenderBounds) {
-                const rb = node.absoluteRenderBounds;
-                // render bounds 给出包含描边的实际像素尺寸
-                base.width = rb.width;
-                base.height = rb.height;
-            } else if (hasStroke) {
-                // 后备：用 strokeWeight 补偿
-                if (base.height === 0 && base.width > 0) {
-                    base.height = node.strokeWeight;
-                } else if (base.width === 0 && base.height > 0) {
-                    base.width = node.strokeWeight;
-                }
-            }
         }
         catch (e) {
             console.error('Failed to export vector as PNG:', e);
@@ -310,7 +296,7 @@ async function parseNode(node, imageRefs, vectorRefs) {
     if ('children' in node) {
         base.children = [];
         for (const child of node.children) {
-            const parsed = await parseNode(child, imageRefs, vectorRefs);
+            const parsed = await parseNode(child, imageRefs, vectorRefs, fontRefs);
             if (parsed) {
                 base.children.push(parsed);
             }

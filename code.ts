@@ -36,9 +36,10 @@ async function handleExport() {
   const nodes: any[] = [];
   const imageRefs: Map<string, Uint8Array> = new Map();
   const vectorRefs: Map<string, Uint8Array> = new Map();
+  const fontRefs: Map<string, { family: string, style: string }> = new Map();
 
   for (const node of selection) {
-    const parsed = await parseNode(node, imageRefs, vectorRefs);
+    const parsed = await parseNode(node, imageRefs, vectorRefs, fontRefs);
     if (parsed) {
       nodes.push(parsed);
     }
@@ -64,6 +65,12 @@ async function handleExport() {
     vectors[nodeId] = base64;
   }
 
+  // 构建字体列表
+  const fonts: { [key: string]: { family: string, style: string } } = {};
+  for (const [key, fontInfo] of fontRefs) {
+    fonts[key] = fontInfo;
+  }
+
   figma.ui.postMessage({
     type: 'progress',
     message: '正在打包...',
@@ -77,7 +84,8 @@ async function handleExport() {
     figmaFile: figma.fileKey || 'unknown',
     nodes: nodes,
     images: images,
-    vectors: vectors
+    vectors: vectors,
+    fonts: fonts
   };
 
   // 发送到 UI 进行下载
@@ -98,7 +106,8 @@ async function handleExport() {
 async function parseNode(
   node: SceneNode,
   imageRefs: Map<string, Uint8Array>,
-  vectorRefs: Map<string, Uint8Array>
+  vectorRefs: Map<string, Uint8Array>,
+  fontRefs: Map<string, { family: string, style: string }>
 ): Promise<any> {
   const base: any = {
     id: node.id,
@@ -264,15 +273,28 @@ async function parseNode(
   // 处理文本
   if (node.type === 'TEXT') {
     base.characters = node.characters;
+
+    // 获取字体信息
+    const fontFamily = node.fontName !== figma.mixed ? (node.fontName as FontName).family : '';
+    const fontWeight = node.fontName !== figma.mixed ? (node.fontName as FontName).style : '';
+
     base.style = {
-      fontFamily: node.fontName !== figma.mixed ? (node.fontName as FontName).family : '',
-      fontWeight: node.fontName !== figma.mixed ? (node.fontName as FontName).style : '',
+      fontFamily: fontFamily,
+      fontWeight: fontWeight,
       fontSize: node.fontSize !== figma.mixed ? node.fontSize : 16,
       lineHeight: node.lineHeight !== figma.mixed ? node.lineHeight : null,
       letterSpacing: node.letterSpacing !== figma.mixed ? node.letterSpacing : null,
       textAlignHorizontal: node.textAlignHorizontal,
       textAlignVertical: node.textAlignVertical,
     };
+
+    // 收集字体信息
+    if (fontFamily && fontWeight) {
+      const fontKey = `${fontFamily}_${fontWeight}`;
+      if (!fontRefs.has(fontKey)) {
+        fontRefs.set(fontKey, { family: fontFamily, style: fontWeight });
+      }
+    }
 
     // 导出矢量文本为高分辨率 PNG
     try {
@@ -309,7 +331,7 @@ async function parseNode(
   if ('children' in node) {
     base.children = [];
     for (const child of node.children) {
-      const parsed = await parseNode(child, imageRefs, vectorRefs);
+      const parsed = await parseNode(child, imageRefs, vectorRefs, fontRefs);
       if (parsed) {
         base.children.push(parsed);
       }
