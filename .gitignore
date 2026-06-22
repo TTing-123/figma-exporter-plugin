@@ -1,3 +1,6 @@
 node_modules/
 
+# 构建产物（由 code.ts 经 tsc 编译生成，勿提交；改完 code.ts 用 npm run build 生成）
+code.js
+
 .DS_Store

@@ -115,6 +115,7 @@ async function parseNode(
     type: node.type,
     visible: node.visible,
     opacity: 'opacity' in node ? node.opacity : 1,
+    rotation: 'rotation' in node ? node.rotation : 0,
     x: 'x' in node ? node.x : 0,
     y: 'y' in node ? node.y : 0,
     width: 'width' in node ? node.width : 0,
@@ -192,11 +193,14 @@ async function parseNode(
 
       if (fill.type === 'IMAGE' && 'imageHash' in fill) {
         fillData.imageRef = fill.imageHash;
-        // 导出图片
+        // 导出原始图片位图（而非节点渲染截图，避免被圆角/叠加填充裁切）
         if (!imageRefs.has(fill.imageHash)) {
           try {
-            const bytes = await node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 2 } });
-            imageRefs.set(fill.imageHash, bytes);
+            const image = figma.getImageByHash(fill.imageHash);
+            if (image) {
+              const bytes = await image.getBytesAsync();
+              imageRefs.set(fill.imageHash, bytes);
+            }
           } catch (e) {
             console.error('Failed to export image:', e);
           }
@@ -204,6 +208,7 @@ async function parseNode(
       }
 
       if (fill.type?.startsWith('GRADIENT_')) {
+        fillData.gradientType = fill.type; // GRADIENT_LINEAR / GRADIENT_RADIAL / GRADIENT_ANGULAR / GRADIENT_DIAMOND
         fillData.gradientStops = fill.gradientStops?.map((stop: any) => ({
           position: stop.position,
           color: {
@@ -296,13 +301,8 @@ async function parseNode(
       }
     }
 
-    // 导出矢量文本为高分辨率 PNG
-    try {
-      const bytes = await node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 3 } });
-      vectorRefs.set(node.id, bytes);
-    } catch (e) {
-      console.error('Failed to export text as PNG:', e);
-    }
+    // 文本节点保持为 Label（由导入端还原字体/字号/颜色），不再导出为 PNG
+    // —— 旧逻辑会导出 3x PNG，但导入端会跳过 TEXT，纯属浪费体积与时间。
   }
 
   // 处理矢量节点 - 导出为高分辨率 PNG
