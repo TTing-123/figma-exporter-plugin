@@ -293,6 +293,11 @@ async function parseNode(
       textAlignVertical: node.textAlignVertical,
     };
 
+    // 文本行为属性（影响尺寸和溢出）
+    base.textAutoResize = node.textAutoResize;  // NONE | WIDTH_AND_HEIGHT | HEIGHT | TRUNCATE
+    base.textDecoration = node.textDecoration !== figma.mixed ? node.textDecoration : 'NONE';
+    base.textCase = node.textCase !== figma.mixed ? node.textCase : 'ORIGINAL';
+
     // 收集字体信息
     if (fontFamily && fontWeight) {
       const fontKey = `${fontFamily}_${fontWeight}`;
