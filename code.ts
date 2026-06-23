@@ -35,7 +35,7 @@ async function handleExport() {
   // 解析选中的节点
   const nodes: any[] = [];
   const imageRefs: Map<string, Uint8Array> = new Map();
-  const vectorRefs: Map<string, Uint8Array> = new Map();
+  const vectorRefs: Map<string, string> = new Map();
   const fontRefs: Map<string, { family: string, style: string }> = new Map();
 
   for (const node of selection) {
@@ -58,11 +58,10 @@ async function handleExport() {
     images[ref] = base64;
   }
 
-  // 导出矢量图形
+  // 导出矢量图形��SVG 字符串）
   const vectors: { [key: string]: string } = {};
-  for (const [nodeId, bytes] of vectorRefs) {
-    const base64 = uint8ArrayToBase64(bytes);
-    vectors[nodeId] = base64;
+  for (const [nodeId, svgText] of vectorRefs) {
+    vectors[nodeId] = svgText;
   }
 
   // 构建字体列表
@@ -106,7 +105,7 @@ async function handleExport() {
 async function parseNode(
   node: SceneNode,
   imageRefs: Map<string, Uint8Array>,
-  vectorRefs: Map<string, Uint8Array>,
+  vectorRefs: Map<string, string>,
   fontRefs: Map<string, { family: string, style: string }>
 ): Promise<any> {
   const base: any = {
@@ -152,8 +151,9 @@ async function parseNode(
     }
   }
 
-  // VECTOR 特殊处理：useAbsoluteBounds:true 导出旋转后的最终视觉效果。
-  // rotation 已烘焙到 PNG 中，JSON 里设为 0；width/height 改为 AABB 尺寸。
+  // VECTOR 特殊处理：SVG 栅格化后是否含旋转待验证（见导入端）。
+  // 暂按「SVG 已烘焙旋转」假设：JSON 里 rotation 设为 0，width/height 改为 AABB 尺寸。
+  // 若验证发现 SVG 未旋转，需删此块并在导入端恢复 rotation 处理。
   const vectorTypes = ['VECTOR', 'BOOLEAN', 'STAR', 'LINE', 'ELLIPSE', 'REGULAR_POLYGON'];
   if (vectorTypes.includes(node.type) && base.rotation !== 0) {
     const rot = base.rotation % 360;
@@ -324,19 +324,15 @@ async function parseNode(
     // —— 旧逻辑会导出 3x PNG，但导入端会跳过 TEXT，纯属浪费体积与时间。
   }
 
-  // 处理矢量节点 - 导出为高分辨率 PNG
+  // 处理矢量节点 - 导出为 SVG（含完整路径数据，不被 bounding box 裁剪）
   if (vectorTypes.includes(node.type)) {
     try {
-      // useAbsoluteBounds: true 让 PNG 按 renderBounds (旋转后 AABB) 导出，
-      // 旋转已烘焙到 PNG 中，无需在 Godot 端再叠加旋转。
-      const bytes = await node.exportAsync({
-        format: 'PNG',
-        constraint: { type: 'SCALE', value: 3 },
-        useAbsoluteBounds: true
-      } as any);
-      vectorRefs.set(node.id, bytes);
+      // SVG 是 UTF-8 文本，exportAsync ��回 Uint8Array
+      const svgBytes = await node.exportAsync({ format: 'SVG' });
+      const svgText = uint8ToUtf8(svgBytes);
+      vectorRefs.set(node.id, svgText);
     } catch (e) {
-      console.error('Failed to export vector as PNG:', e);
+      console.error('Failed to export vector as SVG:', e);
     }
   }
 
@@ -360,6 +356,32 @@ async function parseNode(
 }
 
 // 工具函数：Uint8Array 转 Base64
+// 工具函数：Uint8Array(UTF-8) 转字符串（Figma 沙箱无 TextDecoder）
+function uint8ToUtf8(bytes: Uint8Array): string {
+  let result = '';
+  for (let i = 0; i < bytes.length;) {
+    const b1 = bytes[i++];
+    if (b1 < 0x80) {
+      result += String.fromCharCode(b1);
+    } else if (b1 < 0xE0) {
+      const b2 = bytes[i++];
+      result += String.fromCharCode(((b1 & 0x1F) << 6) | (b2 & 0x3F));
+    } else if (b1 < 0xF0) {
+      const b2 = bytes[i++];
+      const b3 = bytes[i++];
+      result += String.fromCharCode(((b1 & 0x0F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F));
+    } else {
+      const b2 = bytes[i++];
+      const b3 = bytes[i++];
+      const b4 = bytes[i++];
+      const cp = ((b1 & 0x07) << 18) | ((b2 & 0x3F) << 12) | ((b3 & 0x3F) << 6) | (b4 & 0x3F);
+      const adj = cp - 0x10000;
+      result += String.fromCharCode(0xD800 | (adj >> 10), 0xDC00 | (adj & 0x3FF));
+    }
+  }
+  return result;
+}
+
 function uint8ArrayToBase64(bytes: Uint8Array): string {
   let binary = '';
   for (let i = 0; i < bytes.length; i++) {
