@@ -152,6 +152,20 @@ async function parseNode(
     }
   }
 
+  // VECTOR 特殊处理：useAbsoluteBounds:true 导出旋转后的最终视觉效果。
+  // rotation 已烘焙到 PNG 中，JSON 里设为 0；width/height 改为 AABB 尺寸。
+  const vectorTypes = ['VECTOR', 'BOOLEAN', 'STAR', 'LINE', 'ELLIPSE', 'REGULAR_POLYGON'];
+  if (vectorTypes.includes(node.type) && base.rotation !== 0) {
+    const rot = base.rotation % 360;
+    // ±90°: AABB 宽高对换
+    if (Math.abs(Math.abs(rot) - 90) < 0.01 || Math.abs(Math.abs(rot) - 270) < 0.01) {
+      const tmp = base.width;
+      base.width = base.height;
+      base.height = tmp;
+    }
+    base.rotation = 0;
+  }
+
   // 处理自动布局
   if ('layoutMode' in node && node.layoutMode !== 'NONE') {
     base.layoutMode = node.layoutMode;
@@ -311,15 +325,14 @@ async function parseNode(
   }
 
   // 处理矢量节点 - 导出为高分辨率 PNG
-  const vectorTypes = ['VECTOR', 'BOOLEAN', 'STAR', 'LINE', 'ELLIPSE', 'REGULAR_POLYGON'];
   if (vectorTypes.includes(node.type)) {
     try {
-      // useAbsoluteBounds: false 让 PNG 按 layout bounds (几何 bbox = width/height) 导出，
-      // 而非默认的 renderBounds。这样 PNG 尺寸与 figma UI 显示的节点尺寸一致。
+      // useAbsoluteBounds: true 让 PNG 按 renderBounds (旋转后 AABB) 导出，
+      // 旋转已烘焙到 PNG 中，无需在 Godot 端再叠加旋转。
       const bytes = await node.exportAsync({
         format: 'PNG',
         constraint: { type: 'SCALE', value: 3 },
-        useAbsoluteBounds: false
+        useAbsoluteBounds: true
       } as any);
       vectorRefs.set(node.id, bytes);
     } catch (e) {
