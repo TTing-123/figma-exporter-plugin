@@ -162,7 +162,7 @@ async function parseNode(
   // VECTOR 特殊处理：SVG 栅格化后是否含旋转待验证（见导入端）。
   // 暂按「SVG 已烘焙旋转」假设：JSON 里 rotation 设为 0，width/height 改为 AABB 尺寸。
   // 若验证发现 SVG 未旋转，需删此块并在导入端恢复 rotation 处理。
-  const vectorTypes = ['VECTOR', 'BOOLEAN', 'STAR', 'LINE', 'ELLIPSE', 'REGULAR_POLYGON'];
+  const vectorTypes = ['VECTOR', 'BOOLEAN_OPERATION', 'STAR', 'LINE', 'ELLIPSE', 'REGULAR_POLYGON'];
   if (vectorTypes.includes(node.type) && base.rotation !== 0) {
     const rot = base.rotation % 360;
     // ±90°: AABB 宽高对换
