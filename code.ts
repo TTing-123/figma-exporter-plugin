@@ -122,7 +122,15 @@ async function parseNode(
   };
 
   // 获取��对位置
-  if ('absoluteTransform' in node) {
+  // absoluteTransform.translation 是节点「本地原点(0,0)」的页面坐标，对旋转节点
+  // 它落在 bbox 某个角（-90° 时在左下角），与 Figma UI 显示的 Position（AABB
+  // 左上角）不一致——这正是 Vector 40 的 Y 比图上差一个高度(28.44)的原因。
+  // 改用 absoluteBoundingBox 左上角，与 Figma UI 的 X/Y 一致；无旋转时
+  // 本地原点 == bbox 左上角，非旋转节点行为不变。
+  if ('absoluteBoundingBox' in node && node.absoluteBoundingBox) {
+    base.absoluteX = node.absoluteBoundingBox.x;
+    base.absoluteY = node.absoluteBoundingBox.y;
+  } else if ('absoluteTransform' in node) {
     const transform = node.absoluteTransform;
     base.absoluteX = transform[0][2];
     base.absoluteY = transform[1][2];
