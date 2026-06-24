@@ -121,58 +121,31 @@ async function parseNode(
     height: 'height' in node ? node.height : 0,
   };
 
-  // 获取��对位置
-  // absoluteTransform.translation 是节点「本地原点(0,0)」的页面坐标，对旋转节点
-  // 它落在 bbox 某个角（-90° 时在左下角），与 Figma UI 显示的 Position（AABB
-  // 左上角）不一致——这正是 Vector 40 的 Y 比图上差一个高度(28.44)的原因。
-  // 改用 absoluteBoundingBox 左上角，与 Figma UI 的 X/Y 一致；无旋转时
-  // 本地原点 == bbox 左上角，非旋转节点行为不变。
-  if ('absoluteBoundingBox' in node && node.absoluteBoundingBox) {
-    base.absoluteX = node.absoluteBoundingBox.x;
-    base.absoluteY = node.absoluteBoundingBox.y;
-  } else if ('absoluteTransform' in node) {
+  // 获取绝对位置：导出 absoluteTransform 平移分量（节点本地原点的页面坐标）。
+  // 这是 Figma 最原始的几何量，也是导入端按 rotation 计算位置的正确输入。
+  // 非旋转节点本地原点 == AABB 左上角，行为不变。
+  if ('absoluteTransform' in node && node.absoluteTransform) {
     const transform = node.absoluteTransform;
     base.absoluteX = transform[0][2];
     base.absoluteY = transform[1][2];
   }
+  // 补存完整变换矩阵(原始数据)：线性部分 [[m00,m01],[m10,m11]] 含翻转(det<0)。
+  // rotation 标量 = atan2(-m10, m00) 无法区分翻转与旋转，导入端须用完整矩阵算几何中心。
+  if ('relativeTransform' in node && node.relativeTransform) {
+    base.relativeTransform = node.relativeTransform;
+  }
 
-  // GROUP 特殊处理：Figma Plugin API 返回的 GROUP.x/y/width/height 可能不是
-  // UI 显示的真实 bbox（被旋转/变形过的 GROUP 其 transform.translation 不对应
-  // bbox.top-left）。用 absoluteRenderBounds 覆盖，让 JSON 中的数据与 Figma UI
-  // 显示的 X/Y/W/H 一致。
+  // GROUP 自身无几何尺寸：用 absoluteRenderBounds 补 width/height（原始 API）。
+  // absoluteX/Y 已由上面的 absoluteTransform 提供（本地原点），x/y 保持原始相对值。
   if (node.type === 'GROUP' && (node as any).children && (node as any).children.length > 0) {
     const bounds = (node as any).absoluteRenderBounds;
     if (bounds && bounds.width > 0 && bounds.height > 0) {
-      base.absoluteX = bounds.x;
-      base.absoluteY = bounds.y;
       base.width = bounds.width;
       base.height = bounds.height;
-      const parent = (node as any).parent;
-      if (parent && parent.type !== 'PAGE' && 'absoluteTransform' in parent) {
-        const pt = parent.absoluteTransform;
-        base.x = bounds.x - pt[0][2];
-        base.y = bounds.y - pt[1][2];
-      } else {
-        base.x = bounds.x;
-        base.y = bounds.y;
-      }
     }
   }
 
-  // VECTOR 特殊处理：SVG 栅格化后是否含旋转待验证（见导入端）。
-  // 暂按「SVG 已烘焙旋转」假设：JSON 里 rotation 设为 0，width/height 改为 AABB 尺寸。
-  // 若验证发现 SVG 未旋转，需删此块并在导入端恢复 rotation 处理。
   const vectorTypes = ['VECTOR', 'BOOLEAN_OPERATION', 'STAR', 'LINE', 'ELLIPSE', 'REGULAR_POLYGON'];
-  if (vectorTypes.includes(node.type) && base.rotation !== 0) {
-    const rot = base.rotation % 360;
-    // ±90°: AABB 宽高对换
-    if (Math.abs(Math.abs(rot) - 90) < 0.01 || Math.abs(Math.abs(rot) - 270) < 0.01) {
-      const tmp = base.width;
-      base.width = base.height;
-      base.height = tmp;
-    }
-    base.rotation = 0;
-  }
 
   // 处理自动布局
   if ('layoutMode' in node && node.layoutMode !== 'NONE') {
