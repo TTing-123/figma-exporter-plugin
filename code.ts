@@ -322,6 +322,11 @@ async function parseNode(
     base.clipsContent = node.clipsContent;
   }
 
+  // 蒙版标记（原始数据）：mask 形状遮罩同层级后续兄弟，导入端据此重组树实现裁剪
+  if ('isMask' in node) {
+    base.isMask = node.isMask;
+  }
+
   // 递归处理子节点
   if ('children' in node) {
     base.children = [];
