@@ -36,10 +36,12 @@ async function handleExport() {
   const nodes: any[] = [];
   const imageRefs: Map<string, Uint8Array> = new Map();
   const vectorRefs: Map<string, string> = new Map();
+  // 矢量本体几何中心在导出 PNG(@3x)的像素坐标；含阴影/模糊外扩时供导入端精确对齐本体，替代不可靠的 alpha 扫描
+  const vectorBodyCenter: Map<string, [number, number]> = new Map();
   const fontRefs: Map<string, { family: string, style: string }> = new Map();
 
   for (const node of selection) {
-    const parsed = await parseNode(node, imageRefs, vectorRefs, fontRefs);
+    const parsed = await parseNode(node, imageRefs, vectorRefs, fontRefs, vectorBodyCenter);
     if (parsed) {
       nodes.push(parsed);
     }
@@ -64,6 +66,12 @@ async function handleExport() {
     vectors[nodeId] = svgText;
   }
 
+  // 矢量本体中心（PNG @3x 像素）：含阴影/模糊外扩的矢量，记录本体几何框在导出 PNG 中的精确中心
+  const vectorBodyCenterOut: { [key: string]: number[] } = {};
+  for (const [nodeId, center] of vectorBodyCenter) {
+    vectorBodyCenterOut[nodeId] = center;
+  }
+
   // 构建字体列表
   const fonts: { [key: string]: { family: string, style: string } } = {};
   for (const [key, fontInfo] of fontRefs) {
@@ -84,6 +92,7 @@ async function handleExport() {
     nodes: nodes,
     images: images,
     vectors: vectors,
+    vectorBodyCenter: vectorBodyCenterOut,
     fonts: fonts
   };
 
@@ -106,7 +115,8 @@ async function parseNode(
   node: SceneNode,
   imageRefs: Map<string, Uint8Array>,
   vectorRefs: Map<string, string>,
-  fontRefs: Map<string, { family: string, style: string }>
+  fontRefs: Map<string, { family: string, style: string }>,
+  vectorBodyCenter: Map<string, [number, number]>
 ): Promise<any> {
   const base: any = {
     id: node.id,
@@ -307,13 +317,56 @@ async function parseNode(
 
   // 处理矢量节点 - 导出为 SVG（含完整路径数据，不被 bounding box 裁剪）
   if (vectorTypes.includes(node.type)) {
-    try {
-      // SVG 是 UTF-8 文本，exportAsync ��回 Uint8Array
-      const svgBytes = await node.exportAsync({ format: 'SVG' });
-      const svgText = uint8ToUtf8(svgBytes);
-      vectorRefs.set(node.id, svgText);
-    } catch (e) {
-      console.error('Failed to export vector as SVG:', e);
+    const _parent = (node as any).parent;
+    const _isOperand = _parent && _parent.type === 'BOOLEAN_OPERATION';
+    // mask 在 Figma 中只贡献裁剪形状、自身填充不渲染；导入端 mask 为透明裁剪 Control，无需可视填充。
+    // 操作数子节点视觉已烘焙进父 BOOLEAN_OPERATION。两者均跳过导出。
+    const _isMask = (node as any).isMask === true;
+    if (!_isOperand && !_isMask) {
+      const preferPng = _vectorNeedsPng(node);
+      let exported = false;
+      if (!preferPng) {
+        try {
+          const svgBytes = await node.exportAsync({ format: 'SVG' });
+          const svgText = uint8ToUtf8(svgBytes);
+          const hasVector = /<(?:path|circle|ellipse|rect|polygon|polyline|line|use)\b/.test(svgText);
+          if (!hasVector || svgText.includes('<foreignObject')) {
+            throw new Error('SVG has no vector content');
+          }
+          vectorRefs.set(node.id, svgText);
+          exported = true;
+        } catch (e) {
+          console.error('Failed to export vector as SVG, will try PNG:', e);
+        }
+      }
+      if (!exported) {
+        try {
+          const pngBytes = await node.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 3 } });
+          // 解析 PNG IHDR(width@16,height@20,大端)，丢弃空节点导出失败的 1×1 占位
+          if (pngBytes.length >= 24) {
+            const _dv = new DataView(pngBytes.buffer, pngBytes.byteOffset + 16, 8);
+            if (_dv.getUint32(0) >= 2 && _dv.getUint32(4) >= 2) {
+              vectorRefs.set(node.id, 'PNG:' + uint8ArrayToBase64(pngBytes));
+              exported = true;
+              // 记录本体几何中心在导出 PNG(@3x)的像素坐标：PNG 范围 == absoluteRenderBounds(含阴影/模糊外扩)，
+              // 本体框 absoluteBoundingBox 在其中的中心 = (bb.center - rb.topleft) * 3。
+              // 导入端用此精确对齐本体，避开半透明/渐变本体下 alpha 扫描失准导致的位移。
+              const _rb: any = (node as any).absoluteRenderBounds;
+              const _bb: any = (node as any).absoluteBoundingBox;
+              if (_rb && _bb && typeof _rb.x === 'number' && typeof _bb.x === 'number' && typeof _bb.width === 'number') {
+                vectorBodyCenter.set(node.id, [
+                  (_bb.x + _bb.width / 2 - _rb.x) * 3,
+                  (_bb.y + _bb.height / 2 - _rb.y) * 3
+                ]);
+              }
+            } else {
+              console.error('Vector PNG is 1x1 placeholder, skipped:', node.id);
+            }
+          }
+        } catch (e2) {
+          console.error('Failed to export vector as PNG:', e2);
+        }
+      }
     }
   }
 
@@ -331,7 +384,7 @@ async function parseNode(
   if ('children' in node) {
     base.children = [];
     for (const child of node.children) {
-      const parsed = await parseNode(child, imageRefs, vectorRefs, fontRefs);
+      const parsed = await parseNode(child, imageRefs, vectorRefs, fontRefs, vectorBodyCenter);
       if (parsed) {
         base.children.push(parsed);
       }
@@ -366,6 +419,27 @@ function uint8ToUtf8(bytes: Uint8Array): string {
     }
   }
   return result;
+}
+
+// 矢量智能选择 PNG vs SVG：带阴影/模糊/渐变/布尔运算 → Figma PNG（清晰+保真）；简单实心 → SVG（小）。
+function _vectorNeedsPng(node: SceneNode): boolean {
+  if (node.type === 'BOOLEAN_OPERATION') return true;
+  const effects = (node as any).effects;
+  if (Array.isArray(effects)) {
+    for (const e of effects) {
+      if (e.visible === false) continue;
+      if (e.type === 'DROP_SHADOW' || e.type === 'INNER_SHADOW' ||
+          e.type === 'LAYER_BLUR' || e.type === 'BACKGROUND_BLUR') return true;
+    }
+  }
+  const fills = (node as any).fills;
+  if (Array.isArray(fills)) {
+    for (const f of fills) {
+      if (f.visible === false) continue;
+      if (typeof f.type === 'string' && f.type.indexOf('GRADIENT_') === 0) return true;
+    }
+  }
+  return false;
 }
 
 function uint8ArrayToBase64(bytes: Uint8Array): string {
