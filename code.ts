@@ -3,6 +3,8 @@
 
 // 显示 UI
 figma.showUI(__html__, { width: 320, height: 240 });
+// 矢量/mask 导出诊断（临时）：记录每个矢量节点导出尝试结果，定位 mask PNG 失败根因
+let _exportDiagnostics: any[] = [];
 
 // 监听 UI 消息
 figma.ui.onmessage = async (msg) => {
@@ -17,6 +19,7 @@ figma.ui.onmessage = async (msg) => {
 // 主导出函数
 async function handleExport() {
   const selection = figma.currentPage.selection;
+  _exportDiagnostics = [];
 
   if (selection.length === 0) {
     figma.ui.postMessage({
@@ -38,10 +41,13 @@ async function handleExport() {
   const vectorRefs: Map<string, string> = new Map();
   // 矢量本体几何中心在导出 PNG(@3x)的像素坐标；含阴影/模糊外扩时供导入端精确对齐本体，替代不可靠的 alpha 扫描
   const vectorBodyCenter: Map<string, [number, number]> = new Map();
+  // mask 形状的 renderBounds(绝对 x,y,w,h)：mask 用 PNG 导出，PNG 范围=renderBounds(含描边/效果外扩)，
+  // 导入端据此精确对齐 mask alpha 蒙版（PNG 像素范围对应此几何框）。
+  const maskRenderBounds: Map<string, [number, number, number, number]> = new Map();
   const fontRefs: Map<string, { family: string, style: string }> = new Map();
 
   for (const node of selection) {
-    const parsed = await parseNode(node, imageRefs, vectorRefs, fontRefs, vectorBodyCenter);
+    const parsed = await parseNode(node, imageRefs, vectorRefs, fontRefs, vectorBodyCenter, maskRenderBounds);
     if (parsed) {
       nodes.push(parsed);
     }
@@ -72,6 +78,12 @@ async function handleExport() {
     vectorBodyCenterOut[nodeId] = center;
   }
 
+  // mask renderBounds（绝对坐标）：导入端用于 mask alpha 蒙版 UV 对齐
+  const maskRenderBoundsOut: { [key: string]: number[] } = {};
+  for (const [nodeId, rb] of maskRenderBounds) {
+    maskRenderBoundsOut[nodeId] = rb;
+  }
+
   // 构建字体列表
   const fonts: { [key: string]: { family: string, style: string } } = {};
   for (const [key, fontInfo] of fontRefs) {
@@ -93,6 +105,8 @@ async function handleExport() {
     images: images,
     vectors: vectors,
     vectorBodyCenter: vectorBodyCenterOut,
+    maskRenderBounds: maskRenderBoundsOut,
+    exportDiagnostics: _exportDiagnostics,
     fonts: fonts
   };
 
@@ -116,7 +130,8 @@ async function parseNode(
   imageRefs: Map<string, Uint8Array>,
   vectorRefs: Map<string, string>,
   fontRefs: Map<string, { family: string, style: string }>,
-  vectorBodyCenter: Map<string, [number, number]>
+  vectorBodyCenter: Map<string, [number, number]>,
+  maskRenderBounds: Map<string, [number, number, number, number]>
 ): Promise<any> {
   const base: any = {
     id: node.id,
@@ -198,6 +213,9 @@ async function parseNode(
 
       if (fill.type === 'IMAGE' && 'imageHash' in fill) {
         fillData.imageRef = fill.imageHash;
+        fillData.scaleMode = (fill as any).scaleMode;  // FILL(cover,默认)/FIT(contain)/CROP/TILE
+        if ((fill as any).filters) { fillData.filters = (fill as any).filters; }
+        if ((fill as any).scalingFactor !== undefined) { fillData.scalingFactor = (fill as any).scalingFactor; }  // TILE ƽر��������  // ImageFilters: exposure/contrast/saturation/temperature/tint/highlights/shadows (各 -1..1)
         // 导出原始图片位图（而非节点渲染截图，避免被圆角/叠加填充裁切）
         if (!imageRefs.has(fill.imageHash)) {
           try {
@@ -319,13 +337,23 @@ async function parseNode(
   if (vectorTypes.includes(node.type)) {
     const _parent = (node as any).parent;
     const _isOperand = _parent && _parent.type === 'BOOLEAN_OPERATION';
-    // mask 在 Figma 中只贡献裁剪形状、自身填充不渲染；导入端 mask 为透明裁剪 Control，无需可视填充。
-    // 操作数子节点视觉已烘焙进父 BOOLEAN_OPERATION。两者均跳过导出。
     const _isMask = (node as any).isMask === true;
-    if (!_isOperand && !_isMask) {
-      const preferPng = _vectorNeedsPng(node);
+    // mask 形状用 PNG 导出：alpha 精确匹配 Figma 实际裁剪(填充+描边+效果)，SVG 的 viewBox 会裁掉描边外扩
+    // 且不含效果，与 Figma 不一致。导入端 mask 节点为透明 Control，形状 PNG 供被遮罩节点 shader alpha 蒙版。
+    // 操作数(BOOLEAN_OPERATION 子)视觉已烘焙进父，仍跳过。
+    if (!_isOperand) {
       let exported = false;
-      if (!preferPng) {
+      // mask 形状单独导出：isMask 节��自身 exportAsync 是 1x1（不渲染自身），clone ���取消 mask 再导出
+      if (_isMask) {
+        const _ms = await _exportMaskShape(node);
+        if (_ms) {
+          vectorRefs.set(node.id, _ms.content);
+          maskRenderBounds.set(node.id, _ms.rb);
+          exported = true;
+        }
+      }
+      const preferPng = _vectorNeedsPng(node);
+      if (!exported && !preferPng) {
         try {
           const svgBytes = await node.exportAsync({ format: 'SVG' });
           const svgText = uint8ToUtf8(svgBytes);
@@ -334,6 +362,7 @@ async function parseNode(
             throw new Error('SVG has no vector content');
           }
           vectorRefs.set(node.id, svgText);
+          _exportDiagnostics.push({ id: node.id, type: node.type, isMask: _isMask, kind: 'svg_ok' });
           exported = true;
         } catch (e) {
           console.error('Failed to export vector as SVG, will try PNG:', e);
@@ -347,6 +376,7 @@ async function parseNode(
             const _dv = new DataView(pngBytes.buffer, pngBytes.byteOffset + 16, 8);
             if (_dv.getUint32(0) >= 2 && _dv.getUint32(4) >= 2) {
               vectorRefs.set(node.id, 'PNG:' + uint8ArrayToBase64(pngBytes));
+              _exportDiagnostics.push({ id: node.id, type: node.type, isMask: _isMask, kind: 'png_ok' });
               exported = true;
               // 记录本体几何中心在导出 PNG(@3x)的像素坐标：PNG 范围 == absoluteRenderBounds(含阴影/模糊外扩)，
               // 本体框 absoluteBoundingBox 在其中的中心 = (bb.center - rb.topleft) * 3。
@@ -359,18 +389,32 @@ async function parseNode(
                   (_bb.y + _bb.height / 2 - _rb.y) * 3
                 ]);
               }
+              // mask 形状 PNG 范围=renderBounds(含描边/效果外扩)；记录绝对坐标供��入端 UV 对齐
+              if (_isMask && _rb && typeof _rb.x === 'number') {
+                maskRenderBounds.set(node.id, [_rb.x, _rb.y, _rb.width, _rb.height]);
+              }
             } else {
               console.error('Vector PNG is 1x1 placeholder, skipped:', node.id);
+              _exportDiagnostics.push({ id: node.id, type: node.type, isMask: _isMask, kind: '1x1', w: _dv.getUint32(0), h: _dv.getUint32(4) });
             }
           }
         } catch (e2) {
           console.error('Failed to export vector as PNG:', e2);
+          _exportDiagnostics.push({ id: node.id, type: node.type, isMask: _isMask, kind: 'png_error', err: String(e2) });
         }
       }
     }
   }
 
   // 处理裁剪
+  // 非矢量类型 mask（RECTANGLE/FRAME 等）：自身 exportAsync 同样 1x1，clone 导出形状
+  if (!vectorTypes.includes(node.type) && (node as any).isMask === true) {
+    const _ms2 = await _exportMaskShape(node);
+    if (_ms2) {
+      vectorRefs.set(node.id, _ms2.content);
+      maskRenderBounds.set(node.id, _ms2.rb);
+    }
+  }
   if ('clipsContent' in node) {
     base.clipsContent = node.clipsContent;
   }
@@ -384,7 +428,7 @@ async function parseNode(
   if ('children' in node) {
     base.children = [];
     for (const child of node.children) {
-      const parsed = await parseNode(child, imageRefs, vectorRefs, fontRefs, vectorBodyCenter);
+      const parsed = await parseNode(child, imageRefs, vectorRefs, fontRefs, vectorBodyCenter, maskRenderBounds);
       if (parsed) {
         base.children.push(parsed);
       }
@@ -440,6 +484,62 @@ function _vectorNeedsPng(node: SceneNode): boolean {
     }
   }
   return false;
+}
+
+async function _exportMaskShape(node: SceneNode): Promise<{ content: string; rb: [number, number, number, number]; format: string } | null> {
+  // mask 节点 isMask=true ���身不渲染，node.exportAsync 返回 1x1。优先 clone+isMask=false 导 PNG(含描边/效果)；
+  // clone 失败则回退 SVG(SVG 描述路径不受渲染状态影响，范围=boundingBox)。全程记录诊断供定位。
+  const _id = (node as any).id;
+  let _cloneReason = '';
+  try {
+    const clone = node.clone();
+    (clone as any).isMask = false;
+    // clone 放到 currentPage(无父级裁剪)导出：原 parent 链上的 clip frame 会裁 clone 的 exportAsync 与
+    // absoluteRenderBounds（134×134 圆曾被裁成 43×125）。currentPage 无裁剪 → 形状完整。clone 在 page 的
+    // 位置无关(exportAsync 导出节点自身)；rb.w/h 用 clone.absoluteRenderBounds(尺寸正确)，
+    // rb.x/y 用原节点 absoluteTransform 平移分量(=本地原点画布坐标)；node.absoluteX/Y 对部分节点返回
+    // undefined(实测所有 mask 烘出 [null,null,w,h]，导入端 float(null) 崩溃→material 没挂上)。clone 的
+    // renderBounds.x/y 不随 appendChild 定位更新(曾读到 0,0)，不可用。
+    const _tr = (node as any).absoluteTransform;
+    const _absX = _tr ? _tr[0][2] : 0;
+    const _absY = _tr ? _tr[1][2] : 0;
+    figma.currentPage.appendChild(clone);
+    const pngBytes = await clone.exportAsync({ format: 'PNG', constraint: { type: 'SCALE', value: 3 } });
+    const _crb = (clone as any).absoluteRenderBounds;
+    clone.remove();
+    if (pngBytes.length < 24) { _cloneReason = 'png_small(' + pngBytes.length + ')'; }
+    else {
+      const dv = new DataView(pngBytes.buffer, pngBytes.byteOffset + 16, 8);
+      const w = dv.getUint32(0), h = dv.getUint32(4);
+      if (w < 2 || h < 2) { _cloneReason = 'png_1x1(' + w + 'x' + h + ')'; }
+      else {
+        if (!_crb || typeof _crb.x !== 'number') { _cloneReason = 'no_clone_rb'; }
+        else {
+          _exportDiagnostics.push({ id: _id, isMask: true, kind: 'mask_clone_png_ok' });
+          return { content: 'PNG:' + uint8ArrayToBase64(pngBytes), rb: [_absX, _absY, _crb.width, _crb.height], format: 'png' };
+        }
+      }
+    }
+  } catch (e) {
+    _cloneReason = 'err:' + String(e);
+  }
+  let _svgReason = '';
+  try {
+    const svgBytes = await node.exportAsync({ format: 'SVG' });
+    const svgText = uint8ToUtf8(svgBytes);
+    if (/<(?:path|circle|ellipse|rect|polygon|polyline|line|use)\b/.test(svgText)) {
+      const _bb = (node as any).absoluteBoundingBox;
+      if (_bb && typeof _bb.x === 'number') {
+        _exportDiagnostics.push({ id: _id, isMask: true, kind: 'mask_svg_ok', clone_reason: _cloneReason });
+        return { content: svgText, rb: [_bb.x, _bb.y, _bb.width, _bb.height], format: 'svg' };
+      }
+      _svgReason = 'no_bb';
+    } else { _svgReason = 'no_vector(len=' + svgText.length + ')'; }
+  } catch (e2) {
+    _svgReason = 'err:' + String(e2);
+  }
+  _exportDiagnostics.push({ id: _id, isMask: true, kind: 'mask_fail', clone_reason: _cloneReason, svg_reason: _svgReason });
+  return null;
 }
 
 function uint8ArrayToBase64(bytes: Uint8Array): string {
