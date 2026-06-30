@@ -4,3 +4,6 @@ node_modules/
 code.js
 
 .DS_Store
+
+# CodeGraph 本地知识图谱索引（工具生成的本地缓存，勿提交）
+.codegraph/
