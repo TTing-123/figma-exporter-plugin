@@ -41,13 +41,17 @@ async function handleExport() {
   const vectorRefs: Map<string, string> = new Map();
   // 矢量本体几何中心在导出 PNG(@3x)的像素坐标；含阴影/模糊外扩时供导入端精确对齐本体，替代不可靠的 alpha 扫描
   const vectorBodyCenter: Map<string, [number, number]> = new Map();
+  // 矢量本体几何中心(全局绝对坐标 = absoluteBoundingBox.center)：所有矢量节点(SVG+PNG)统一记录，
+  // 导入端据此精确定位本体中心(_cx=x+(absCx-node.absoluteX))，替代 relativeTransform+尺寸推算
+  // (反射 VECTOR 路径在定义框内偏移每节点不同，width/height/SVG viewBox 均无法推算)。
+  const vectorBodyAbsCenter: Map<string, [number, number]> = new Map();
   // mask 形状的 renderBounds(绝对 x,y,w,h)：mask 用 PNG 导出，PNG 范围=renderBounds(含描边/效果外扩)，
   // 导入端据此精确对齐 mask alpha 蒙版（PNG 像素范围对应此几何框）。
   const maskRenderBounds: Map<string, [number, number, number, number]> = new Map();
   const fontRefs: Map<string, { family: string, style: string }> = new Map();
 
   for (const node of selection) {
-    const parsed = await parseNode(node, imageRefs, vectorRefs, fontRefs, vectorBodyCenter, maskRenderBounds);
+    const parsed = await parseNode(node, imageRefs, vectorRefs, fontRefs, vectorBodyCenter, vectorBodyAbsCenter, maskRenderBounds);
     if (parsed) {
       nodes.push(parsed);
     }
@@ -78,6 +82,12 @@ async function handleExport() {
     vectorBodyCenterOut[nodeId] = center;
   }
 
+  // 矢量本体中心(全局绝对坐标)：导入端精确定位本体几何中心
+  const vectorBodyAbsCenterOut: { [key: string]: number[] } = {};
+  for (const [nodeId, center] of vectorBodyAbsCenter) {
+    vectorBodyAbsCenterOut[nodeId] = center;
+  }
+
   // mask renderBounds（绝对坐标）：导入端用于 mask alpha 蒙版 UV 对齐
   const maskRenderBoundsOut: { [key: string]: number[] } = {};
   for (const [nodeId, rb] of maskRenderBounds) {
@@ -105,6 +115,7 @@ async function handleExport() {
     images: images,
     vectors: vectors,
     vectorBodyCenter: vectorBodyCenterOut,
+    vectorBodyAbsCenter: vectorBodyAbsCenterOut,
     maskRenderBounds: maskRenderBoundsOut,
     exportDiagnostics: _exportDiagnostics,
     fonts: fonts
@@ -131,6 +142,7 @@ async function parseNode(
   vectorRefs: Map<string, string>,
   fontRefs: Map<string, { family: string, style: string }>,
   vectorBodyCenter: Map<string, [number, number]>,
+  vectorBodyAbsCenter: Map<string, [number, number]>,
   maskRenderBounds: Map<string, [number, number, number, number]>
 ): Promise<any> {
   const base: any = {
@@ -263,6 +275,21 @@ async function parseNode(
             a: stroke.opacity !== undefined ? stroke.opacity : 1
           }
         });
+      } else if (stroke.type?.startsWith('GRADIENT_')) {
+        // 渐变描边（GRADIENT_LINEAR/RADIAL/ANGULAR/DIAMOND），与 fill 渐变处理对齐
+        base.strokes.push({
+          type: stroke.type,
+          gradientStops: stroke.gradientStops?.map((stop: any) => ({
+            position: stop.position,
+            color: {
+              r: stop.color.r,
+              g: stop.color.g,
+              b: stop.color.b,
+              a: stop.color.a
+            }
+          })),
+          gradientTransform: stroke.gradientTransform
+        });
       }
     }
   }
@@ -342,6 +369,15 @@ async function parseNode(
     // 且不含效果，与 Figma 不一致。导入端 mask 节点为透明 Control，形状 PNG 供被遮罩节点 shader alpha 蒙版。
     // 操作数(BOOLEAN_OPERATION 子)视觉已烘焙进父，仍跳过。
     if (!_isOperand) {
+      // 记录本体几何中心(全局 absoluteRenderBounds.center)：SVG+PNG 统一，导入端精确定位。
+      // 必须用 renderBounds ��非 absoluteBoundingBox：VECTOR 的 absoluteBoundingBox 是"定义框"，
+      // 路径可能不填满(2:704 定义框 10×15 / 路径 10×9；2:705 定义框 10×15 / 路径 5×5)，
+      // 共享定义框的节点会��出相同中心(2:704/705/706 都=定义框中心)→导入端把不同部件钉在同一点。
+      // renderBounds 是真实渲染范围(无效果时=路径 bbox)，中心每节点不同，定位准确。
+      const _rbAbs: any = (node as any).absoluteRenderBounds;
+      if (_rbAbs && typeof _rbAbs.x === 'number' && typeof _rbAbs.width === 'number') {
+        vectorBodyAbsCenter.set(node.id, [_rbAbs.x + _rbAbs.width / 2, _rbAbs.y + _rbAbs.height / 2]);
+      }
       let exported = false;
       // mask 形状单独导出：isMask 节��自身 exportAsync 是 1x1（不渲染自身），clone ���取消 mask 再导出
       if (_isMask) {
@@ -378,16 +414,13 @@ async function parseNode(
               vectorRefs.set(node.id, 'PNG:' + uint8ArrayToBase64(pngBytes));
               _exportDiagnostics.push({ id: node.id, type: node.type, isMask: _isMask, kind: 'png_ok' });
               exported = true;
-              // 记录本体几何中心在导出 PNG(@3x)的像素坐标：PNG 范围 == absoluteRenderBounds(含阴影/模糊外扩)，
-              // 本体框 absoluteBoundingBox 在其中的中心 = (bb.center - rb.topleft) * 3。
-              // 导入端用此精确对齐本体，避开半透明/渐变本体下 alpha 扫描失准导致的位移。
+              // 记录本体几何中心在导出 PNG(@3x)的像素坐标：PNG 范围 == absoluteRenderBounds(含阴影/模糊外扩)。
+              // 导入端据此把 rect 锚到 renderBounds 左上(_cx - rb.w/2 = rb.topleft)，rect=renderBounds 范围，
+              // 纹理填满 rect，路径在纹理内位置由烘焙自然正确。用 renderBounds 中心(PNG 中心)而非定义框中心——
+              // 定义框中心对"路径不填满定义框"的矢量会偏(定义框中心 ≠ 路径中心)，导致整体位移。
               const _rb: any = (node as any).absoluteRenderBounds;
-              const _bb: any = (node as any).absoluteBoundingBox;
-              if (_rb && _bb && typeof _rb.x === 'number' && typeof _bb.x === 'number' && typeof _bb.width === 'number') {
-                vectorBodyCenter.set(node.id, [
-                  (_bb.x + _bb.width / 2 - _rb.x) * 3,
-                  (_bb.y + _bb.height / 2 - _rb.y) * 3
-                ]);
+              if (_rb && typeof _rb.x === 'number' && typeof _rb.width === 'number') {
+                vectorBodyCenter.set(node.id, [_rb.width / 2 * 3, _rb.height / 2 * 3]);
               }
               // mask 形状 PNG 范围=renderBounds(含描边/效果外扩)；记录绝对坐标供��入端 UV 对齐
               if (_isMask && _rb && typeof _rb.x === 'number') {
@@ -428,7 +461,7 @@ async function parseNode(
   if ('children' in node) {
     base.children = [];
     for (const child of node.children) {
-      const parsed = await parseNode(child, imageRefs, vectorRefs, fontRefs, vectorBodyCenter, maskRenderBounds);
+      const parsed = await parseNode(child, imageRefs, vectorRefs, fontRefs, vectorBodyCenter, vectorBodyAbsCenter, maskRenderBounds);
       if (parsed) {
         base.children.push(parsed);
       }
