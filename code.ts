@@ -18,13 +18,15 @@ figma.ui.onmessage = async (msg) => {
 
 // 主导出函数
 async function handleExport() {
-  const selection = figma.currentPage.selection;
+  // 导出当前页所有 top-level frame（非 SECTION，有几何尺寸）：支持多 frame → 多场景/原型。
+  const allTop: SceneNode[] = (figma.currentPage.children as SceneNode[])
+    .filter(n => n.type !== 'SECTION' && 'width' in n && (n as any).width > 0);
   _exportDiagnostics = [];
 
-  if (selection.length === 0) {
+  if (allTop.length === 0) {
     figma.ui.postMessage({
       type: 'error',
-      message: '请先选中一个节点'
+      message: '当前页无可导出的 top-level frame'
     });
     return;
   }
@@ -49,9 +51,11 @@ async function handleExport() {
   // 导入端据此精确对齐 mask alpha 蒙版（PNG 像素范围对应此几何框）。
   const maskRenderBounds: Map<string, [number, number, number, number]> = new Map();
   const fontRefs: Map<string, { family: string, style: string }> = new Map();
+  // 原型 reactions 平表（跨节点图边）：sourceId→destinationId+trigger+transition，顶层平表便于导入端建路由
+  const reactionsAccum: any[] = [];
 
-  for (const node of selection) {
-    const parsed = await parseNode(node, imageRefs, vectorRefs, fontRefs, vectorBodyCenter, vectorBodyAbsCenter, maskRenderBounds);
+  for (const node of allTop) {
+    const parsed = await parseNode(node, imageRefs, vectorRefs, fontRefs, vectorBodyCenter, vectorBodyAbsCenter, maskRenderBounds, reactionsAccum);
     if (parsed) {
       nodes.push(parsed);
     }
@@ -108,7 +112,7 @@ async function handleExport() {
 
   // 构建导出数据
   const exportData = {
-    version: '1.0.0',
+    version: '2.0.0',
     exportedAt: new Date().toISOString(),
     figmaFile: figma.fileKey || 'unknown',
     nodes: nodes,
@@ -118,7 +122,8 @@ async function handleExport() {
     vectorBodyAbsCenter: vectorBodyAbsCenterOut,
     maskRenderBounds: maskRenderBoundsOut,
     exportDiagnostics: _exportDiagnostics,
-    fonts: fonts
+    fonts: fonts,
+    reactions: reactionsAccum
   };
 
   // 发送到 UI 进行下载
@@ -143,7 +148,8 @@ async function parseNode(
   fontRefs: Map<string, { family: string, style: string }>,
   vectorBodyCenter: Map<string, [number, number]>,
   vectorBodyAbsCenter: Map<string, [number, number]>,
-  maskRenderBounds: Map<string, [number, number, number, number]>
+  maskRenderBounds: Map<string, [number, number, number, number]>,
+  reactionsAccum: any[]
 ): Promise<any> {
   const base: any = {
     id: node.id,
@@ -457,11 +463,23 @@ async function parseNode(
     base.isMask = node.isMask;
   }
 
+  // 原型 reactions 平表：仅 FrameNode/ComponentNode/InstanceNode 拥有 reactions 属性。
+  // 透传嵌套 action（navigation.destinationId / transition），导入端据此建原型路由。
+  try {
+    if ('reactions' in node && Array.isArray((node as any).reactions)) {
+      for (const r of (node as any).reactions) {
+        _extract_reaction(node.id, r, reactionsAccum);
+      }
+    }
+  } catch (e) {
+    console.error('reactions read failed:', node.id, e);
+  }
+
   // 递归处理子节点
   if ('children' in node) {
     base.children = [];
     for (const child of node.children) {
-      const parsed = await parseNode(child, imageRefs, vectorRefs, fontRefs, vectorBodyCenter, vectorBodyAbsCenter, maskRenderBounds);
+      const parsed = await parseNode(child, imageRefs, vectorRefs, fontRefs, vectorBodyCenter, vectorBodyAbsCenter, maskRenderBounds, reactionsAccum);
       if (parsed) {
         base.children.push(parsed);
       }
@@ -469,6 +487,59 @@ async function parseNode(
   }
 
   return base;
+}
+
+// 把单条 Figma reaction 展平为路由条目 push 进平表。
+// Plugin API 真实结构（@figma/plugin-typings）：
+//   action.type = 'NODE' | 'BACK' | 'CLOSE' | 'URL' | ...（Action 联合类型）
+//   NODE action：destinationId / navigation / transition / overlayRelativePosition / preserveScrollPosition
+//                全是 action 平级字段；navigation 是字符串字面量 'NAVIGATE'|'SWAP'|'OVERLAY'|'SCROLL_TO'|'CHANGE_TO'，非嵌套对象。
+//   transition（SimpleTransition|DirectionalTransition）：type / direction / easing / duration（秒，如 0.2）→ 这里转 ms。
+//   trigger.type = ON_KEY_DOWN(带 keyCodes) / AFTER_TIMEOUT(带 timeout ms) / MOUSE_ENTER|LEAVE|UP|DOWN / ON_HOVER|PRESS|CLICK|DRAG。
+function _extract_reaction(sourceId: string, r: any, out: any[]): void {
+  if (!r || typeof r !== 'object') return;
+  const trigger = r.trigger || {};
+  const action = r.action || {};
+  const entry: any = {
+    sourceId: sourceId,
+    triggerType: trigger.type || 'ON_CLICK',
+    actionType: action.type || 'NODE',
+  };
+  if (trigger.type === 'AFTER_TIMEOUT' && typeof trigger.timeout === 'number') {
+    entry.triggerDelayMs = trigger.timeout; // ms
+  }
+  // NODE action：navigation 字符串直读，destinationId 等平级字段直读
+  if (action.type === 'NODE') {
+    entry.navigationType = action.navigation || 'NAVIGATE';
+    if (action.destinationId) {
+      entry.destinationId = action.destinationId;
+    }
+    if (action.preserveScrollPosition) {
+      entry.preserveScrollPosition = true;
+    }
+    if (action.overlayRelativePosition) {
+      entry.overlayRelativePosition = action.overlayRelativePosition; // {x,y}，仅 OVERLAY 且目标 overlayPosition=MANUAL
+    }
+  } else if (action.type === 'BACK' || action.type === 'CLOSE') {
+    // BACK/CLOSE 无 navigation/destinationId；router 按 navigationType 分派，故透传 action.type
+    entry.navigationType = action.type;
+  }
+  // transition：duration 为秒，转 ms 供 router 统一用
+  const tr = action.transition;
+  if (tr && typeof tr === 'object') {
+    if (tr.type) entry.transitionType = tr.type;
+    if (tr.direction) entry.direction = tr.direction;
+    if (typeof tr.duration === 'number') entry.durationMs = Math.round(tr.duration * 1000);
+    const ease = tr.easing;
+    if (ease && ease.type) entry.easingType = ease.type;
+  }
+  if (action.type === 'URL' && action.url) {
+    entry.url = action.url; // actionType=URL 时打开链接
+  }
+  if (trigger.type === 'ON_KEY_DOWN' && Array.isArray(trigger.keyCodes) && trigger.keyCodes.length > 0) {
+    entry.keyCodes = trigger.keyCodes; // ON_KEY_DOWN 触发键
+  }
+  out.push(entry);
 }
 
 // 工具函数：Uint8Array 转 Base64
