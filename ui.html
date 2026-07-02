@@ -186,7 +186,6 @@
       parent.postMessage({ pluginMessage: { type: 'cancel' } }, '*');
     });
 
-    // 监听插件消息
     window.onmessage = (event) => {
       const msg = event.data.pluginMessage;
 
@@ -203,7 +202,6 @@
       }
 
       if (msg.type === 'download') {
-        // 创建下载链接
         const blob = new Blob([msg.data], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -214,7 +212,6 @@
         document.body.removeChild(a);
         URL.revokeObjectURL(url);
 
-        // 完成后重新启用按钮
         setTimeout(() => {
           exportBtn.disabled = false;
           progressText.textContent = '导出完成！可以关闭此窗口。';
