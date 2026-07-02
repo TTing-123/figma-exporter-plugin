@@ -112,7 +112,7 @@ async function handleExport() {
 
   // 构建导出数据
   const exportData = {
-    version: '2.0.0',
+    version: '1.0.0',
     exportedAt: new Date().toISOString(),
     figmaFile: figma.fileKey || 'unknown',
     nodes: nodes,
