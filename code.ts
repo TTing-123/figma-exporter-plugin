@@ -298,6 +298,21 @@ async function parseNode(
   if (node.type === 'TEXT') {
     base.characters = node.characters;
 
+    // Per-segment text colors (multi-color text): getStyledTextSegments returns runs of uniform fill,
+    // each with start/end/fills. Importer builds RichTextLabel BBCode from this.
+    const segs = (node as any).getStyledTextSegments(['fills']) || [];
+    if (segs.length > 0) {
+      const out = segs.map((s: any) => ({
+        start: s.start,
+        end: s.end,
+        fills: (s.fills || []).filter((f: any) => f.visible !== false).map((f: any) => {
+          if (f.type === 'SOLID') return { type: 'SOLID', color: { r: f.color.r, g: f.color.g, b: f.color.b, a: f.opacity !== undefined ? f.opacity : 1 } };
+          return null;
+        }).filter(Boolean)
+      })).filter((s: any) => s.fills.length > 0);
+      if (out.length > 0) base.textSegments = out;
+    }
+
     const fontFamily = node.fontName !== figma.mixed ? (node.fontName as FontName).family : '';
     const fontWeight = node.fontName !== figma.mixed ? (node.fontName as FontName).style : '';
 
