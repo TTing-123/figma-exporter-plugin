@@ -201,6 +201,7 @@ async function parseNode(
         fillData.scaleMode = (fill as any).scaleMode;
         if ((fill as any).filters) { fillData.filters = (fill as any).filters; }
         if ((fill as any).scalingFactor !== undefined) { fillData.scalingFactor = (fill as any).scalingFactor; }
+        if ((fill as any).imageTransform) { fillData.imageTransform = (fill as any).imageTransform; }
         if (!imageRefs.has(fill.imageHash)) {
           try {
             const image = figma.getImageByHash(fill.imageHash);
